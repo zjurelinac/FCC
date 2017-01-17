@@ -11,19 +11,22 @@ SPECIAL_ALU_OPERATIONS = {'*': '_MUL', '/': '_DIV', '%': '_MOD'}
 
 
 class FriscGenerator(NodeVisitor):
-    INIT_SP = 0x1000
+    INIT_SP = 0x2000
+    USE_ORIGIN = False
+    SET_SP = False
+    DEBUG = False
 
     def __init__(self):
         self.generic_labels = {'fn': 0, 'fn_ret': 0,
                                'var': 0, 'const': 0,
-                               'if_true': 0, 'if_false': 0,
+                               'if_true': 0, 'if_false': 0, 'if_end': 0,
                                'cmp_true': 0, 'cmp_end': 0,
-                               'for': 0, 'for_end': 0,
+                               'for': 0, 'for_next': 0, 'for_end': 0,
                                'while': 0, 'while_end': 0,
                                'dowhile': 0, 'dowhile_end': 0, 'dowhile_cond': 0}
         self.constants = {}
         self.labels = {}
-        self.memory = {'data': [''], 'header': [], 'code': []}
+        self.memory = {'data': [''], 'header': [], 'main_call': [], 'code': []}
         self.registers = {'R0': None, 'R1': None, 'R2': None, 'R3': None}
 
         # Main function location (label)
@@ -33,12 +36,12 @@ class FriscGenerator(NodeVisitor):
         self.has_MDM = True
 
     def generate(self, ast):
-        ast.show()
+        if self.DEBUG:
+            ast.show()
+        self._generate_boilerplate()
         self.visit(ast, Scope())
-        self._generate_header()
-        print('=' * 80)
-        print('\n'.join(self.memory['header'] + self.memory['code'] + self.memory['data']))
-        print('=' * 80)
+        self._generate_main_call()
+        return ('\n'.join(self.memory['header'] + self.memory['main_call'] + self.memory['code'] + self.memory['data']))
 
     def visit(self, node, scope=None, labels=None):
         """Return results of visiting a node with a proper method"""
@@ -68,14 +71,14 @@ class FriscGenerator(NodeVisitor):
         ar = ArrayReference(base_code, base_value, index_code, index_value)
         return [], ar
 
-    def visit_Assignment(self, node, scope, labels=None) -> [str]:
+    def visit_Assignment(self, node, scope, labels=None) -> ([str], Value):
         if node.op != '=':
             node.rvalue = BinaryOp(node.op[:-1], node.lvalue, node.rvalue)
         code = ['; Assignment @%s' % node.coord]
         rcode, rvalue = self.visit(node.rvalue, scope, labels)
         lcode, lvalue = self.visit(node.lvalue, scope, labels)
         code += rcode + rvalue.fetch_to_stack() + lcode + lvalue.save_from_stack() + ['']
-        return code
+        return code, lvalue
 
     def visit_BinaryOp(self, node, scope, labels=None) -> ([str], Value):
         lcode, lvalue = self.visit(node.left, scope, labels)
@@ -145,6 +148,8 @@ class FriscGenerator(NodeVisitor):
                         dtype.length = rvalue.type.length
                 scope[dname] = Variable(dname, dtype, 'R5-0%X' % local_scope.registered_space())
                 scope.register_space(dtype.size())
+                if rvalue is not None:
+                    dcode += scope[dname].save_from_stack()
                 code += dcode
             else:
                 tret = self.visit(c, local_scope, labels)
@@ -170,6 +175,7 @@ class FriscGenerator(NodeVisitor):
         if node.init is not None:
             rcode, rvalue = self.visit(node.init, scope, labels)
             code += rcode + rvalue.fetch_to_stack()
+            rvalue = Intermediate(rvalue.type, 'S')
         else:
             rvalue = None
         return code, node.name, type, rvalue
@@ -177,10 +183,10 @@ class FriscGenerator(NodeVisitor):
     def visit_DeclList(self, node, scope, labels=None):
         raise CompileError('A DeclList! Haven\'t seen this in a while... actually, never! What to do??!', node.coord)
 
-    def visit_DoWhile(self, node, scope, labels=None):
+    def visit_DoWhile(self, node, scope, labels=None) -> [str]:
         dowhile_label, dowhile_end_label, dowhile_cond_label = \
             self._make_label('dowhile'), self._make_label('dowhile_end'), self._make_label('dowhile_cond')
-        labels.update({'continue': dowhile_cond_label, 'end': dowhile_end_label})
+        labels = dict(labels, **{'continue': dowhile_cond_label, 'end': dowhile_end_label})
         code = ['; Do-While loop',
                 dowhile_label]
         body_ret = self.visit(node.stmt, scope, labels)
@@ -205,7 +211,7 @@ class FriscGenerator(NodeVisitor):
     def visit_ExprList(self, node, scope, labels=None) -> [str]:
         code = []
         for e in reversed(node.exprs):
-            tcode, tvalue = self.visit(e)
+            tcode, tvalue = self.visit(e, scope, labels)
             code += tcode + tvalue.fetch_to_stack()
         return code
 
@@ -222,21 +228,58 @@ class FriscGenerator(NodeVisitor):
                 scope[dname] = Variable(dname, dtype, location)
                 if rvalue is not None:
                     code += scope[dname].save_from_stack()
-                self.memory['code'] += code
+                self.memory['header'] += code
             else:
                 self.visit(e, scope, labels)
 
-    # def visit_For(self, node, scope, labels=None):
-    #     pass
-    # for (init; cond; next) stmt
-    #
-    # For: [init*, cond*, next*, stmt*]
+    def visit_For(self, node, scope, labels=None) -> ['str']:
+        for_label, for_next_label, for_end_label = \
+            self._make_label('for'), self._make_label('for_next'), self._make_label('for_end')
+        labels = dict(labels, **{'continue': 0, 'end': 0})
+        code = ['; For loop']
+        if node.cond is not None:
+            cond_code, cond_value = self.visit(node.cond, scope, labels)
+            cond_code += cond_value.bool_evaluate()
+        else:
+            cond_code = []
+        if node.next is not None:
+            next_ret = self.visit(node.next, scope, labels)
+            if isinstance(next_ret, tuple):
+                next_code, next_value = next_ret
+                if isinstance(next_value, (Intermediate, Bool)):
+                    next_code += ['\tPOP R0  ; stack cleanup']
+            else:
+                next_code = next_ret
+        if node.init is not None:
+            init_ret = self.visit(node.init, scope, labels)
+            if isinstance(init_ret, tuple):
+                init_code = init_ret[0]
+            else:
+                init_code = init_ret
+        else:
+            init_code = []
+        stmt_ret = self.visit(node.stmt, scope, labels)
+        if isinstance(stmt_ret, tuple):
+            stmt_code, stmt_value = stmt_ret
+            if isinstance(stmt_value, (Intermediate, Bool)):
+                stmt_code += ['\tPOP R0  ; stack cleanup']
+        else:
+            stmt_code = stmt_ret
+        code += init_code + [for_label] + cond_code
+        code += ['\tPOP R0',
+                 '\tCMP R0, 0',
+                 '\tJR_EQ %s' % for_end_label]
+        code += stmt_code + [for_next_label] + next_code + ['\tJR %s' % for_label, for_end_label]
+
+        return code
 
     def visit_FuncCall(self, node, scope, labels=None):
         _, func = self.visit(node.name, scope, labels)
         code = ['; Function call %s' % func.name]
-        code += self.visit(node.args, scope, labels)
+        if node.args is not None:
+            code += self.visit(node.args, scope, labels)
         code += ['\tCALL %s' % func.address,
+                 '\tADD SP, 0%X, SP' % func.type.params_size(),
                  '\tPUSH R6']
         return code, Intermediate(Primitive('int'), 'S')
 
@@ -255,7 +298,7 @@ class FriscGenerator(NodeVisitor):
         if name == 'main':
             self.main_fn = start_label
 
-        params_addr = 12
+        params_addr = 8
         for param in params:
             local_scope[param[0]] = Variable(param[0], param[1], 'R5+0%X' % params_addr)
             params_addr += 4
@@ -279,7 +322,8 @@ class FriscGenerator(NodeVisitor):
         return Primitive(node.names[-1], unsigned=node.names[0] == 'unsigned')
 
     def visit_If(self, node, scope, labels=None) -> [str]:
-        if_true_label, if_false_label = self._make_label('if_true'), self._make_label('if_false')
+        if_true_label, if_false_label, if_end_label = \
+            self._make_label('if_true'), self._make_label('if_false'), self._make_label('if_end')
         cond_code, cond_value = self.visit(node.cond, scope, labels)
         true_ret = self.visit(node.iftrue, scope, labels)
         if isinstance(true_ret, tuple):
@@ -303,7 +347,7 @@ class FriscGenerator(NodeVisitor):
                  '\tCMP R0, 0',
                  '\tJR_EQ %s' % if_false_label,
                  if_true_label]
-        code += true_code + [if_false_label] + false_code
+        code += true_code + ['\tJR %s' % if_end_label, if_false_label] + false_code + [if_end_label]
         return code
 
     def visit_InitList(self, node, scope, labels=None):
@@ -334,6 +378,7 @@ class FriscGenerator(NodeVisitor):
             value = Intermediate(Primitive('int'), 'S')
         elif node.op == '*':
             if not isinstance(value.type, Pointer):
+                print('NAP!', code, value)
                 raise CompileError('Not a pointer!', node)
             code, value = [], PointerReference(code, value)
         elif node.op == '+':
@@ -356,10 +401,11 @@ class FriscGenerator(NodeVisitor):
             code += ['\tPOP R1',
                      '\tXOR R1, 1, R1',
                      '\tPUSH R1']
+            value = Bool()
         elif node.op == '++':
             code += value.fetch_to_stack()
             code += ['\tPOP R1',
-                     '\tADD R1, %d, R1' % (1 if not isinstance(value.type, Pointer) else LOG_TYPE_SIZES[value.type.type.size]),
+                     '\tADD R1, %d, R1' % (1 if not isinstance(value.type, Pointer) else value.type.type.size()),
                      '\tPUSH R1',
                      '\tPUSH R1']
             code += value.save_from_stack()
@@ -368,14 +414,14 @@ class FriscGenerator(NodeVisitor):
             code += value.fetch_to_stack()
             code += ['\tPOP R1',
                      '\tPUSH R1',
-                     '\tADD R1, %d, R1' % (1 if not isinstance(value.type, Pointer) else LOG_TYPE_SIZES[value.type.type.size]),
+                     '\tADD R1, %d, R1' % (1 if not isinstance(value.type, Pointer) else value.type.type.size()),
                      '\tPUSH R1']
             code += value.save_from_stack()
             value = Intermediate(value.type, 'S')
         elif node.op == '--':
             code += value.fetch_to_stack()
             code += ['\tPOP R1',
-                     '\tSUB R1, %d, R1' % (1 if not isinstance(value.type, Pointer) else LOG_TYPE_SIZES[value.type.type.size]),
+                     '\tSUB R1, %d, R1' % (1 if not isinstance(value.type, Pointer) else value.type.type.size()),
                      '\tPUSH R1',
                      '\tPUSH R1']
             code += value.save_from_stack()
@@ -384,7 +430,7 @@ class FriscGenerator(NodeVisitor):
             code += value.fetch_to_stack()
             code += ['\tPOP R1',
                      '\tPUSH R1',
-                     '\tSUB R1, %d, R1' % (1 if not isinstance(value.type, Pointer) else LOG_TYPE_SIZES[value.type.type.size]),
+                     '\tSUB R1, %d, R1' % (1 if not isinstance(value.type, Pointer) else value.type.type.size()),
                      '\tPUSH R1']
             code += value.save_from_stack()
             value = Intermediate(value.type, 'S')
@@ -393,7 +439,7 @@ class FriscGenerator(NodeVisitor):
 
     def visit_While(self, node, scope, labels=None) -> [str]:
         while_label, while_end_label = self._make_label('while'), self._make_label('while_end')
-        labels.update({'continue': while_label, 'end': while_end_label})
+        labels = dict(labels, **{'continue': while_label, 'end': while_end_label})
         cond_code, cond_value = self.visit(node.cond, scope, labels)
         code = ['; While loop',
                 while_label]
@@ -467,44 +513,49 @@ class FriscGenerator(NodeVisitor):
     def visit_Pragma(self, node, scope, labels=None):
         raise UnsupportedFeature('Pragmas')
 
-    def _generate_header(self):
+    def _generate_main_call(self):
         if self.main_fn is None:
             raise Exception('main() function not defined anywhere in the code!!!')
-        self.memory['header'] = ['\tORG 0',
-                                 '\tMOVE 0%X, SP' % self.INIT_SP,
-                                 '\tCALL %s' % self.main_fn,
-                                 '\tHALT',
+        self.memory['main_call'] = ['',
+                                    '; Main function call',
+                                    '\tCALL %s' % self.main_fn,
+                                    '\tCALL RETURN',
+                                    '']
+
+    def _generate_boilerplate(self):
+        self.memory['header'] = ['\tORG 0' if self.USE_ORIGIN else '; No origin used',
+                                 '\tMOVE 0%X, SP' % self.INIT_SP if self.SET_SP else '; Don\'t set SP'
                                  '']
         if self.has_MDM:
-            self.memory['header'].extend(['_MUL',
-                                          '\tMOVE 0, R6',
-                                          '_MULLOOP',
-                                          '\tCMP R2, 0',
-                                          '\tJP_Z _MULEND',
-                                          '\tADD R6, R1, R6',
-                                          '\tSUB R2, 1, R2',
-                                          '\tJP _MULLOOP',
-                                          '_MULEND',
-                                          '\tRET',
-                                          ''])
-            self.memory['header'].extend(['_DIV',
-                                          '\tMOVE 0, R6',
-                                          '_DIVLOOP',
-                                          '\tSUB R1, R2, R1',
-                                          '\tJP_ULT _DIVEND',
-                                          '\tADD R6, 1, R6',
-                                          '\tJP _DIVLOOP',
-                                          '_DIVEND',
-                                          '\tRET',
-                                          ''])
-            self.memory['header'].extend(['_MOD',
-                                          '\tSUB R1, R2, R1',
-                                          '\tJP_ULT _MODEND',
-                                          '\tJP _MOD',
-                                          '_MODEND',
-                                          '\tADD R1, R2, R6',
-                                          '\tRET',
-                                          ''])
+            self.memory['code'].extend(['_MUL',
+                                        '\tMOVE 0, R6',
+                                        '_MULLOOP',
+                                        '\tCMP R2, 0',
+                                        '\tJP_Z _MULEND',
+                                        '\tADD R6, R1, R6',
+                                        '\tSUB R2, 1, R2',
+                                        '\tJP _MULLOOP',
+                                        '_MULEND',
+                                        '\tRET',
+                                        ''])
+            self.memory['code'].extend(['_DIV',
+                                        '\tMOVE 0, R6',
+                                        '_DIVLOOP',
+                                        '\tSUB R1, R2, R1',
+                                        '\tJP_ULT _DIVEND',
+                                        '\tADD R6, 1, R6',
+                                        '\tJP _DIVLOOP',
+                                        '_DIVEND',
+                                        '\tRET',
+                                        ''])
+            self.memory['code'].extend(['_MOD',
+                                        '\tSUB R1, R2, R1',
+                                        '\tJP_ULT _MODEND',
+                                        '\tJP _MOD',
+                                        '_MODEND',
+                                        '\tADD R1, R2, R6',
+                                        '\tRET',
+                                        ''])
 
     def _make_label(self, name, spec=''):
         cnt = self.generic_labels[name]

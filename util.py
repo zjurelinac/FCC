@@ -132,6 +132,9 @@ class FunctionType(Type):
     def size(self):
         return 0
 
+    def params_size(self):
+        return 4 * len(self.param_types)
+
 
 class Value:
     """A value of an expression"""
@@ -213,19 +216,23 @@ class Constant(Value):
         return '<%s const> %s @ [%s]' % (self.type, self.value, self.address)
 
     def fetch_to_stack(self):
+        code = ['; Fetching constant %s' % self.address]
         if isinstance(self.type, Primitive):
-            return ['; Fetching constant %s' % self.address,
-                    '\tLOAD%s R4, (%s)' % (LOAD_SIZE_MODIFIER[self.size], self.address),
-                    '\tPUSH R4']
+            code += ['\tLOAD%s R4, (%s)' % (LOAD_SIZE_MODIFIER[self.size], self.address),
+                     '\tPUSH R4']
         elif isinstance(self.type, Array):
-            code = ['; Fetching constant array',
-                    '\tMOVE %s, R4' % self.address,
-                    '\tMOVE 0%X, R1' % self.size,
-                    '\tADD R4, R1, R4']
-            code += ['\tSUB R4, 0%X, R4' % self.type.type.size(),
-                     '\tLOAD%s R0, (R4)' % LOAD_SIZE_MODIFIER[self.type.type.size()],
-                     '\tPUSH R0'] * self.type.length
-            return code
+            code += fetch_address(self.address)
+        return code
+
+    # def fetch_array_contents_to_stack(self):
+    #     code = ['; Fetching constant array',
+    #             '\tMOVE %s, R4' % self.address,
+    #             '\tMOVE 0%X, R1' % self.size,
+    #             '\tADD R4, R1, R4']
+    #     code += ['\tSUB R4, 0%X, R4' % self.type.type.size(),
+    #              '\tLOAD%s R0, (R4)' % LOAD_SIZE_MODIFIER[self.type.type.size()],
+    #              '\tPUSH R0'] * self.type.length
+    #     return code
 
 
 class Intermediate(Value):
@@ -337,9 +344,6 @@ class Function(Value):
 
     def __str__(self):
         return '<fn %s :: %s> (%s>' % (self.name, self.type, self.params)
-
-    def params_size(self):
-        return sum(param.size() for param in self.params)
 
 
 def parse_int(s):
