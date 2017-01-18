@@ -47,7 +47,7 @@ class Scope:
         if self.depth > 1:
             self.parent.register_space(size)
         else:
-            self.space += size
+            self.space += (size + 3) // 4 * 4
 
     def registered_space(self):
         return self.parent.registered_space() if self.depth > 1 else self.space
@@ -85,7 +85,7 @@ class Primitive(Type):
     def define_value(self, value):
         if self.typename == 'void':
             raise TypeError('VOID can have no value!')
-        value = parse_int(value) if self.typename != 'char' else ord(value[1])
+        value = parse_int(value) if self.typename != 'char' else ord(eval(value))
         return '%s 0%X' % (self.TYPE_DEFINES[self.typename], value)
 
 
@@ -105,7 +105,7 @@ class Array(Type):
 
     def define_value(self, value):
         if self.type.typename == 'char':
-            value = map(ord, value.strip('"') + '\0')
+            value = map(ord, eval(value) + '\0')
         return '%s %s' % (Primitive.TYPE_DEFINES[self.type.typename], ', '.join(map(lambda x: '0%X' % x, value)))
 
 

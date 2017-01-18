@@ -1,0 +1,530 @@
+;###############################################################################
+;#  FRISC OS v0.1
+;#  --------------------------------------------------------------------------
+;#  Author:         Zvonimir Jurelinac
+;#  Description:    A basic bootloader and operating system for FRISC
+;#                  processing system implemented on Zynq ZedBoard.
+;#
+;#  Code sections:
+;#  --------------------------------------------------------------------------
+;#  1. CONSTANTS DEFINITION
+;#  2. DEFAULT START SEQUENCE
+;#  5. OPERATING SYSTEM MAIN PROCEDURES
+;#  6. SYSTEM CALLS DEFINITION
+;#  7. SERIAL COMMUNICATION PROCEDURES
+;#  9. OS MEMORY SPACE
+;#  10. USER SPACE
+;###############################################################################
+
+;===============================================================================
+;   1. CONSTANTS DEFINITION
+;===============================================================================
+
+;----- IMPORTANT OS MEMORY LOCATIONS -------------------------------------------
+; _INT_CB_DEF_CNT_ADDR      Address of INT callback def. counter - how many callbacks already defined
+; _INT_CB_DEF_START_ADDR    Starting address for INT callback definitions
+
+;----- VARIOUS DEFINITIONS -----------------------------------------------------
+_IO_CB_DEF_SIZE         EQU 16      ;   Single IO callback definition size
+                                    ;   IO callback definition contains:
+                                    ;       IO_UNIT_SR_ADDR - IO unit's status register address
+                                    ;       IO_UNIT_SR_MASK - Status register interrupt AND mask
+                                    ;       IO_UNIT_CB_ADDR - Starting address of callback procedure
+_IO_CB_DEF_SIZE_LG      EQU 4       ;   Log2(IO_CB_DEF_SIZE)
+
+; ----- IO UNITS LOCATIONS ------------------------------------------------------
+; AXI-connected units are located on addressess from FFF80000 to FFFF0000
+; Internal FRISC units are located on addresses from FFFF0000 to FFFFFFFF
+
+; AXI GPIO - LEDs (4)
+IO_LEDS_WRITE_REG       EQU 0FFF80000
+
+; AXI GPIO - buttons (4)
+IO_BTN_READ_REG         EQU 0FFF82000
+IO_BTN_GIE_REG          EQU 0FFF8211C
+IO_BTN_IE_REG           EQU 0FFF82128
+IO_BTN_ISTAT_REG        EQU 0FFF82120
+
+; AXI GPIO - RGB LEDs (2x3)
+IO_RGBLEDS_WRITE_REG    EQU 0FFF83000
+
+; AXI GPIO - switches (2)
+IO_SW_READ_REG          EQU 0FFF84000
+IO_SW_GIE_REG           EQU 0FFF8411C
+IO_SW_IE_REG            EQU 0FFF84128
+IO_SW_ISTAT_REG         EQU 0FFF84120
+
+; AXI UARTlite
+IO_UART_READ_REG        EQU 0FFF81000
+IO_UART_WRITE_REG       EQU 0FFF81004
+IO_UART_STAT_REG        EQU 0FFF81008
+IO_UART_CTRL_REG        EQU 0FFF8100C
+
+
+;----- Constants ---------------------------------------------------------------
+_CHAR_SPACE             EQU 20
+_CHAR_NEWLINE           EQU 0A
+
+
+;===============================================================================
+;   2. DEFAULT START SEQUENCE
+;===============================================================================
+                ORG 0
+_OS_START       JP _OS_MAIN
+
+
+;===============================================================================
+;   5. OPERATING SYSTEM MAIN PROCEDURES
+;===============================================================================
+
+_OS_MAIN
+;###############################################################################
+;#  Main operating system procedure
+;#      - system initialization
+;#      - interrupt setup
+;#      - FRISC programming console
+;#          - Available remote commands:
+;#              - S - set memory block values
+;#                  - arguments - start_address (INT)
+;#                              - block_size (INT)
+;#                              - elements (INT * block_size)
+;#              - G - get memory block values
+;#                  - arguments - start_address (INT)
+;#                              - block_size (INT)
+;#              - X - execute code
+;#                  - arguments - start_location (INT)
+;#              - R - reset processor
+;###############################################################################
+
+_OS_INIT        MOVE 2000, SP
+
+_OS_BOOT_START  MOVE _FRISC_BOOT_MSG, R0
+                CALL SERIAL_WRITE_STRING
+
+_OS_CMD_LOOP    MOVE _FRISC_CMD_PROMPT, R0
+                CALL SERIAL_WRITE_STRING
+
+                CALL SERIAL_READ_CHAR
+                MOVE R0, R1
+                MOVE _FRISC_CMD_RECEIVE_MSG, R0
+                CALL SERIAL_WRITE_STRING
+
+                MOVE R1, R0
+                CALL SERIAL_WRITE_CHAR
+
+                CMP R0, 53
+                JP_EQ _OS_SET_MEM_CMD
+
+                CMP R0, 47
+                JP_EQ _OS_GET_MEM_CMD
+
+                CMP R0, 58
+                JP_EQ _OS_EXEC_LOC_CMD
+
+                CMP R0, 48
+                JP_EQ _OS_HALT_EXEC_CMD
+
+                CMP R0, 52
+                JP_EQ _OS_RESET
+
+                CALL SERIAL_WRITE_NEWLINE
+                MOVE _FRISC_UNKNOWN_CMD_MSG, R0
+                CALL SERIAL_WRITE_STRING
+                JP _OS_CMD_LOOP
+
+
+_OS_SET_MEM_CMD
+                CALL SERIAL_WRITE_SPACE
+                CALL SERIAL_READ_HEX
+                CALL SERIAL_WRITE_HEX
+                MOVE R0, R1
+                CALL SERIAL_WRITE_SPACE
+                CALL SERIAL_READ_HEX
+                CALL SERIAL_WRITE_HEX
+                MOVE R0, R2
+
+                CALL SERIAL_WRITE_NEWLINE
+_OS_SET_MEM_LOOP
+                CALL SERIAL_READ_HEX
+                STORE R0, (R1)
+                ADD R1, 4, R1
+                SUB R2, 1, R2
+                JP_NZ _OS_SET_MEM_LOOP
+
+                MOVE _FRISC_SET_MEM_SUCC_MSG, R0
+                CALL SERIAL_WRITE_STRING
+                JP _OS_CMD_LOOP
+
+
+_OS_GET_MEM_CMD
+                CALL SERIAL_WRITE_SPACE
+                CALL SERIAL_READ_HEX
+                CALL SERIAL_WRITE_HEX
+                MOVE R0, R1
+                CALL SERIAL_WRITE_SPACE
+                CALL SERIAL_READ_HEX
+                CALL SERIAL_WRITE_HEX
+                MOVE R0, R2
+
+                CALL SERIAL_WRITE_NEWLINE
+
+                MOVE _FRISC_GET_MEM_MSG, R0
+                CALL SERIAL_WRITE_STRING
+_OS_GET_MEM_LOOP
+                LOAD R0, (R1)
+                CALL SERIAL_WRITE_HEX
+                CALL SERIAL_WRITE_NEWLINE
+
+                ADD R1, 4, R1
+                SUB R2, 1, R2
+                JP_NZ _OS_GET_MEM_LOOP
+
+                JP _OS_CMD_LOOP
+
+
+_OS_EXEC_LOC_CMD
+                CALL SERIAL_WRITE_NEWLINE
+                CALL SERIAL_READ_HEX
+                MOVE R0, R1
+                MOVE _FRISC_EXEC_MSG, R0
+                CALL SERIAL_WRITE_STRING
+                MOVE R1, R0
+                CALL SERIAL_WRITE_HEX
+                CALL SERIAL_WRITE_NEWLINE
+
+                JP (R1)
+
+
+_OS_HALT_EXEC_CMD
+                CALL SERIAL_WRITE_NEWLINE
+                MOVE _FRISC_HALT_MSG, R0
+                CALL SERIAL_WRITE_STRING
+                MOVE 0, SR                      ; disable masking interrupts
+                HALT
+
+
+_OS_RESET
+;###############################################################################
+;#  System reset signal handler
+;#      - resets register states
+;#      - reinitializes the whole system
+;#      - restarts OS boot sequence
+;#      TODO: prevent multiple resets
+;###############################################################################
+                CALL SERIAL_WRITE_NEWLINE
+                MOVE _FRISC_RESET_MSG, R0
+                CALL SERIAL_WRITE_STRING
+                MOVE 0, R0
+                STORE R0, (IO_LEDS_WRITE_REG)
+                STORE R0, (IO_RGBLEDS_WRITE_REG)
+                MOVE 0, R1
+                MOVE 0, R2
+                MOVE 0, R3
+                MOVE 0, R4
+                MOVE 0, R5
+                MOVE 0, R6
+                MOVE 0, SR
+                JP _OS_INIT
+
+
+;===============================================================================
+;   6. SYSTEM CALLS DEFINITION
+;===============================================================================
+
+
+RETURN
+;###############################################################################
+;#  Return program execution to the operating system
+;#
+;#   ::     No arguments
+;#   =>     Nothing
+;###############################################################################
+                POP R0
+                JP _OS_CMD_LOOP
+
+
+
+;===============================================================================
+;   7. SERIAL COMMUNICATION PROCEDURES
+;===============================================================================
+
+SERIAL_READ_CHAR
+;###############################################################################
+;#  Read byte from the UART serial connection - blocking
+;#
+;#   ::     No arguments
+;#   =>     READ_BYTE (R0)      - byte that was read
+;#
+;###############################################################################
+_SR_RD_CH_LOOP  LOAD R0, (IO_UART_STAT_REG)
+                AND R0, 1, R0
+                JP_Z _SR_RD_CH_LOOP
+                LOADB R0, (IO_UART_READ_REG)
+                RET
+
+
+SERIAL_WRITE_CHAR
+;###############################################################################
+;#  Write byte to the UART serial connection - blocking, uses transmit FIFO
+;#
+;#   ::     WRITE_BYTE(R0)      - byte to be written
+;#   =>     Nothing
+;#
+;#          R1 - auxiliary register
+;###############################################################################
+                PUSH R1
+_SR_WR_CH_LOOP  LOAD R1, (IO_UART_STAT_REG)
+                AND R1, 8, R1
+                JP_NZ _SR_WR_CH_LOOP
+                STOREB R0, (IO_UART_WRITE_REG)
+                POP R1
+                RET
+
+
+SERIAL_READ_INT
+;###############################################################################
+;#  Read integer from the UART serial connection - blocking
+;#  Expects big-endian byte transfer - network order
+;#
+;#   ::     No arguments
+;#   =>     READ_INT (R0)       - integer that was read
+;#
+;#          R1 - auxiliary register
+;#          R2 - bit counter
+;###############################################################################
+                PUSH R1
+                PUSH R2
+                MOVE 0, R1
+                MOVE %D 32, R2
+_SR_RD_INT_LOOP SUB R2, 8, R2
+                CALL SERIAL_READ_CHAR
+                SHL R0, R2, R0
+                OR R1, R0, R1
+                CMP R2, 0
+                JP_NZ _SR_RD_INT_LOOP
+                MOVE R1, R0
+                POP R2
+                POP R1
+                RET
+
+
+SERIAL_WRITE_INT
+;###############################################################################
+;#  Write integer to the UART serial connection - blocking
+;#  Expects big-endian byte transfer - network order
+;#
+;#   ::     WRITE_INT (R0)      - integer to be written
+;#   =>     Nothing
+;#
+;#          R1 - auxiliary register
+;#          R2 - bit count
+;###############################################################################
+                PUSH R0
+                PUSH R1
+                PUSH R2
+                MOVE R0, R1
+                MOVE %D 32, R2
+
+_SR_WR_INT_LOOP SUB R2, 8, R2
+                MOVE 0FF, R0
+                SHL R0, R2, R0
+                AND R0, R1, R0
+                SHR R0, R2, R0
+                CALL SERIAL_WRITE_CHAR
+                CMP R2, 0
+                JP_NZ _SR_WR_INT_LOOP
+
+                POP R2
+                POP R1
+                POP R0
+                RET
+
+
+SERIAL_READ_HEX
+;###############################################################################
+;#  Read integer as hex string from the UART serial connection - blocking
+;#  Hex constans should be uppercase - ex. ABCD, 12FF
+;#   ::     No arguments
+;#   =>     READ_INT (R0)       - integer to be read
+;#
+;#          R1 - auxiliary register
+;#          R2 - bit count
+;###############################################################################
+                PUSH R1
+                PUSH R2
+                MOVE 0, R1
+                MOVE 8, R2
+_SR_RD_HEX_LOOP CALL SERIAL_READ_CHAR
+                CMP R0, %D 57
+                JP_UGT _SR_RD_HEX_XDIG
+                SUB R0, %D 48, R0
+                JP _SR_RD_HEX_ADD
+_SR_RD_HEX_XDIG SUB R0, %D 55, R0
+_SR_RD_HEX_ADD  SHL R1, 4, R1
+                OR R1, R0, R1
+                SUB R2, 1, R2
+                JP_NZ _SR_RD_HEX_LOOP
+                MOVE R1, R0
+                POP R2
+                POP R1
+                RET
+
+
+SERIAL_WRITE_HEX
+;###############################################################################
+;#  Write integer as hex string to the UART serial connection - blocking
+;#
+;#   ::     WRITE_INT (R0)      - integer to be written
+;#   =>     Nothing
+;#
+;#          R1 - auxiliary register
+;#          R2 - bit count
+;#          R3 - auxiliary register
+;###############################################################################
+                PUSH R0
+                PUSH R1
+                PUSH R2
+                PUSH R3
+                MOVE R0, R3
+                MOVE %D 32, R2
+_SR_WR_HEX_LOOP SUB R2, 4, R2
+                MOVE 0F, R1
+                SHL R1, R2, R1
+                AND R1, R3, R1
+                SHR R1, R2, R1
+                CMP R1, 9
+                JP_UGT _SR_WR_HEX_XDIG
+                ADD R1, %D 48, R0
+                JP _SR_WR_HEX_STR
+_SR_WR_HEX_XDIG ADD R1, %D 55, R0
+_SR_WR_HEX_STR  CALL SERIAL_WRITE_CHAR
+                CMP R2, 0
+                JP_NZ _SR_WR_HEX_LOOP
+                POP R3
+                POP R2
+                POP R1
+                POP R0
+                RET
+
+
+SERIAL_READ_STRING
+;###############################################################################
+;#  Read a null-character terminated string to the UART serial connection up to
+;#          N characters - blocking
+;#
+;#   ::     READ_STR_ADDR (R0)  - address of location where to store the read
+;#                                string
+;#          MAX_STR_LEN (R1)    - maximum number of chars to be read (includes
+;#                                terminal '\0')
+;#   =>     Nothing
+;#
+;#          R2 - auxiliary register
+;###############################################################################
+                PUSH R2
+                MOVE R0, R2
+                SUB R1, 1, R1
+                JP_ULT _SR_RD_STR_END
+_SR_RD_STR_LOOP CALL SERIAL_READ_CHAR
+                STOREB R0, (R2)
+                ADD R2, 1, R2
+                CMP R0, 0
+                JP_Z _SR_RD_STR_END
+                SUB R1, 1, R1
+                JP_NZ _SR_WR_STR_LOOP
+                MOVE 0, R0
+                STOREB R0, (R2)
+_SR_RD_STR_END  POP R2
+                RET
+
+
+SERIAL_WRITE_STRING
+;###############################################################################
+;#  Write a null-character terminated string to the UART serial connection
+;#          - blocking
+;#
+;#   ::     WRITE_STR_ADDR (R0)     - starting address of the string to be sent
+;#   =>     Nothing
+;#
+;#          R1 - auxiliary register
+;###############################################################################
+                PUSH R0
+                PUSH R1
+                MOVE R0, R1
+_SR_WR_STR_LOOP LOADB R0, (R1)
+                CMP R0, 0
+                JP_EQ _SR_WR_STR_END
+                CALL SERIAL_WRITE_CHAR
+                ADD R1, 1, R1
+                JP _SR_WR_STR_LOOP
+_SR_WR_STR_END  POP R1
+                POP R0
+                RET
+
+
+SERIAL_WRITE_SPACE
+;###############################################################################
+;#  Write a single space character to the UART serial connection
+;#
+;#   ::     No arguments
+;#   =>     Nothing
+;#
+;#          R0 - auxiliary register
+;###############################################################################
+                PUSH R0
+                MOVE _CHAR_SPACE, R0
+                CALL SERIAL_WRITE_CHAR
+                POP R0
+                RET
+
+
+SERIAL_WRITE_NEWLINE
+;###############################################################################
+;#  Write a single \n character to the UART serial connection
+;#
+;#   ::     No arguments
+;#   =>     Nothing
+;#
+;#          R0 - auxiliary register
+;###############################################################################
+                PUSH R0
+                MOVE _CHAR_NEWLINE, R0
+                CALL SERIAL_WRITE_CHAR
+                POP R0
+                RET
+
+
+
+;===============================================================================
+;   9. OS MEMORY SPACE
+;===============================================================================
+
+_INT_CB_DEF_CNT_ADDR    DW 0
+_INT_CB_DEF_START_ADDR  DS 100
+
+                        ; "\n\nFRISC OS booting...\n\0"
+_FRISC_BOOT_MSG         DB 0A, 0A, 46, 52, 49, 53, 43, 20, 4F, 53, 20, 62, 6F, 6F, 74, 69, 6E, 67, 2E, 2E, 2E, 0A, 00
+                        ; "Restarting FRISC...\n\0"
+_FRISC_RESET_MSG        DB 52, 65, 73, 74, 61, 72, 74, 69, 6E, 67, 20, 46, 52, 49, 53, 43, 2E, 2E, 2E, 0A, 00
+                        ; "Unknown command\n\0"
+_FRISC_UNKNOWN_CMD_MSG  DB 55, 6E, 6B, 6E, 6F, 77, 6E, 20, 63, 6F, 6D, 6D, 61, 6E, 64, 0A, 00
+                        ; "FRISC>\0"
+_FRISC_CMD_PROMPT       DB 46, 52, 49, 53, 43, 3E, 00
+                        ; "Received command: \0"
+_FRISC_CMD_RECEIVE_MSG  DB 52, 65, 63, 65, 69, 76, 65, 64, 20, 63, 6F, 6D, 6D, 61, 6E, 64, 3A, 20, 00
+                        ; "Memory write successful.\n\0"
+_FRISC_SET_MEM_SUCC_MSG DB 4D, 65, 6D, 6F, 72, 79, 20, 77, 72, 69, 74, 65, 20, 73, 75, 63, 63, 65, 73, 73, 66, 75, 6C, 2E, 0A, 00
+                        ; "Memory contents:\n\0"
+_FRISC_GET_MEM_MSG      DB 4D, 65, 6D, 6F, 72, 79, 20, 63, 6F, 6E, 74, 65, 6E, 74, 73, 3A, 0A, 00
+                        ; "Executing instructions from address: \0"
+_FRISC_EXEC_MSG         DB 45, 78, 65, 63, 75, 74, 69, 6E, 67, 20, 69, 6E, 73, 74, 72, 75, 63, 74, 69, 6F, 6E, 73, 20, 66, 72, 6F, 6D, 20, 61, 64, 64, 72, 65, 73, 73, 3A, 20, 00
+                        ; "Halting FRISC processor.\n\0"
+_FRISC_HALT_MSG         DB 48, 61, 6C, 74, 69, 6E, 67, 20, 46, 52, 49, 53, 43, 20, 70, 72, 6F, 63, 65, 73, 73, 6F, 72, 2E, 0A, 00
+
+
+;===============================================================================
+;  10. USER SPACE PROGRAMS
+;===============================================================================
+
+                ORG 540
+                DW 0
+                END

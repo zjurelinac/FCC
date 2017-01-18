@@ -87,7 +87,9 @@ class FriscGenerator(NodeVisitor):
             code = ['; ALU op %s' % node.op]
             code += rcode + rvalue.fetch_to_stack() + lcode + lvalue.fetch_to_stack()
             if node.op in SPECIAL_ALU_OPERATIONS:
-                code += ['\tCALL %s' % SPECIAL_ALU_OPERATIONS[node.op],
+                code += ['\tPOP R1',
+                         '\tPOP R2',
+                         '\tCALL %s' % SPECIAL_ALU_OPERATIONS[node.op],
                          '\tPUSH R6']
             else:
                 code += ['\tPOP R1',
@@ -235,7 +237,7 @@ class FriscGenerator(NodeVisitor):
     def visit_For(self, node, scope, labels=None) -> ['str']:
         for_label, for_next_label, for_end_label = \
             self._make_label('for'), self._make_label('for_next'), self._make_label('for_end')
-        labels = dict(labels, **{'continue': 0, 'end': 0})
+        labels = dict(labels, **{'continue': for_next_label, 'end': for_end_label})
         code = ['; For loop']
         if node.cond is not None:
             cond_code, cond_value = self.visit(node.cond, scope, labels)
@@ -273,7 +275,7 @@ class FriscGenerator(NodeVisitor):
 
         return code
 
-    def visit_FuncCall(self, node, scope, labels=None):
+    def visit_FuncCall(self, node, scope, labels=None) -> ([str], Value):
         _, func = self.visit(node.name, scope, labels)
         code = ['; Function call %s' % func.name]
         if node.args is not None:
